@@ -37,12 +37,17 @@ uint32_t native_store_pair(Cpu*c,uint64_t address,unsigned width,uint64_t low,ui
 '''
 
 
-def split_dispatch(pages,limit,stop_at=None,chain=False):
+def split_dispatch(pages,limit,stop_at=None,chain=False,functions=None):
     from .native_trace import emit_page,emit_execute
     groups={}
     for page,cases in sorted(pages.items()):
         groups.setdefault(page>>5,[]).append(emit_page(page,cases,limit,stop_at,external=True,chain=chain))
-    units={group:SUPPORT+'\n'.join(parts) for group,parts in groups.items()}
+    # (--functions) fn_<entry> functions go to their entry page's unit, with prototypes of the ones they call
+    for entry,(text,called) in sorted((functions or {}).items()):
+        groups.setdefault(entry>>17,[]).append(''.join(f'void fn_{t:x}(Cpu*);\n' for t in sorted(called))+text)
+    from .function_codegen import VOLATILE_MEMORY
+    support=SUPPORT+(VOLATILE_MEMORY+'void fn_guest_call(Cpu*,uint64_t);\n' if functions else '')
+    units={group:support+'\n'.join(parts) for group,parts in groups.items()}
     dispatch=BRIDGE+f'\nconst uint64_t native_instruction_limit={limit}ull;\n'+'\n'.join(f'void page_{page:x}(Cpu*);' for page in sorted(pages))
     return units,dispatch+'\n'+emit_execute(pages,stop_at)
 

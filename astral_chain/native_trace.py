@@ -44,7 +44,7 @@ def whole_text_ranges(image, limit):
     return ranges
 
 
-def translate(image, reference, seeds, limit, nodes=None, *, all_text=False):
+def translate(image, reference, seeds, limit, nodes=None, *, all_text=False, switches=None):
     dense_ranges=whole_text_ranges(image,limit) if all_text else ()
     verify_reference(reference)
     sys.path.insert(0, str(reference/'tools'))
@@ -102,6 +102,7 @@ def translate(image, reference, seeds, limit, nodes=None, *, all_text=False):
                 targets=switch_targets(module,module.nso.unpack('<'+str(count)+'I',offset-(count-1)*4),pc)
                 if targets:
                     queue.extend(targets);followed_switches.add(pc)
+                    if switches is not None: switches[pc]=list(targets)
             body += f'uint64_t target={op.target}; '
             if op.kind == 'blr':
                 body += f'c->x[30]={after}ull; trace_call({pc}ull,target); '
@@ -158,6 +159,8 @@ PAGE_LEAN = False
 # else returns too. Targets the runtime intercepts (HLE overrides, nvnBootstrapLoader) keep the dispatcher.
 DIRECT_PAGES = set()
 DIRECT_EXCLUDE = set()
+# --functions (function_codegen): entries with a fn_<entry> function; a direct call to one calls it instead.
+FN_ENTRIES = set()
 _BL_TAIL = re.compile(r'c->x\[30\]=(\d+)ull; c->pc=(\d+)ull; break; \}$')
 
 
@@ -168,6 +171,9 @@ def _direct_call(text, called):
     target = int(m.group(2))
     if target >> 12 not in DIRECT_PAGES or target in DIRECT_EXCLUDE:
         return text
+    if target in FN_ENTRIES:
+        called.add(('fn', target))
+        return text[:m.start()] + f'c->x[30]={m.group(1)}ull; c->pc={target}ull; fn_{target:x}(c); break; }}'
     called.add(target >> 12)
     return text[:m.start()] + f'c->x[30]={m.group(1)}ull; c->pc={target}ull; page_{target >> 12:x}(c); break; }}'
 
@@ -210,7 +216,8 @@ def emit_page(page,cases,limit,stop_at=None,external=False,chain=False):
             if chain: cases=chain_cases(cases)
             cases=_local_jumps(cases,page)
             chain=False  # (already chained)
-        protos=''.join(f'void page_{p:x}(Cpu*);\n' for p in sorted(called - {page}))
+        protos=''.join(f'void page_{p:x}(Cpu*);\n' for p in sorted(p for p in called if type(p) is int and p != page))
+        protos+=''.join(f'void fn_{t:x}(Cpu*);\n' for _,t in sorted(p for p in called if type(p) is tuple))
         parts=[f'{protos}{"" if external else "static "}__attribute__((noinline)) void page_{page:x}(Cpu *{PAGE_RESTRICT}c) {{\nwhile((c->pc>>12)=={page}ull) {{\nswitch(c->pc) {{']
         parts.extend(cases if PAGE_JUMPS else chain_cases(cases) if chain else sorted(cases))  # (--jumps: ordered and chained above)
         parts.append('default: boundary("untranslated",c,c->pc);\n} } }')
@@ -238,6 +245,17 @@ def emit_execute(pages,stop_at=None):
     for page in sorted(pages):
         parts.append(f'case {page}ull: page_{page:x}(c); break;')
     parts.append('default: boundary("untranslated",c,c->pc); } } }')
+    # (--functions) fn_guest_call: run guest code from c->pc until it reaches ret (a call fn_ code does not follow itself).
+    # Nested at most 24 deep per host thread: guest code that switches context (a fiber, a longjmp) need never come
+    # back to ret, and each such switch inside the loop would keep its host frame. Past the limit it returns at once
+    # with c->pc elsewhere, so the fn_ caller leaves too and an outer loop or the dispatcher goes on.
+    parts.append('static __thread unsigned fn_guest_depth;\n'
+                 'void fn_guest_call(Cpu *c,uint64_t ret) { if(fn_guest_depth>=24) return; fn_guest_depth++; '
+                 'while(c->pc!=ret) { if(thread_reschedule) thread_checkpoint(c,executed_steps); if(c->pc==0x7fffffffffffull) break; '
+                 'HLE_INTERCEPT(c) switch(c->pc>>12) {')
+    for page in sorted(pages):
+        parts.append(f'case {page}ull: page_{page:x}(c); break;')
+    parts.append('default: boundary("untranslated",c,c->pc); } } fn_guest_depth--; }')
     return '\n'.join(parts)
 
 
@@ -355,6 +373,7 @@ def main():
     parser.add_argument('--lean',action='store_true',help='No step counter, checkpoints or call trace in translated code (forces AC_PARALLEL)')
     parser.add_argument('--direct-calls',action='store_true',help='With --lean: BL to a translated page calls its function directly')
     parser.add_argument('--jumps',action='store_true',help='With --lean: branches within a page jump to their case directly')
+    parser.add_argument('--functions',help="With --direct-calls and cached builds: function-shaped C for BL targets (function_codegen); 'all', or a file listing the guest pages (hex) whose functions get one")
     parser.add_argument('--patch',type=Path,action='append',default=[],help='pchtxt code patch for main (enabled sections; checked against its build ID)')
     parser.add_argument('--account-profile',type=Path,default=Path(__file__).resolve().parent.parent/'userdata/account.json',help='Persistent local PC profile JSON, created once if missing')
     parser.add_argument('--language',choices=LANGUAGES,default='en-GB',help='Preferred language; falls back to supported English or first supported locale')
@@ -500,16 +519,26 @@ if(BCryptGenRandom(NULL,(PUCHAR)entropy,sizeof(entropy),BCRYPT_USE_SYSTEM_PREFER
             for module in image.modules:
                 seeds.extend(target for target in adjacent_code_targets(module,pointer_observed) if target not in known)
         nodes={} if args.dispatch=='blocks' else None
-        pages, translation = translate(image, reference, seeds, args.instructions,nodes,all_text=args.seed_all_text)
+        fn_nodes,switches=({},{}) if args.functions else (None,None)
+        pages, translation = translate(image, reference, seeds, args.instructions,nodes if nodes is not None else fn_nodes,
+                                       all_text=args.seed_all_text,switches=switches)
+        functions=None
         if args.lean and args.direct_calls:
             from . import native_trace as imported
             imported.DIRECT_PAGES = set(pages)
             imported.DIRECT_EXCLUDE = {image.symbols[name][0] for name in (*HLE_SYMBOLS, 'nvnBootstrapLoader') if name in image.symbols}
+            if args.functions:
+                from .function_codegen import plan, emit_function
+                wanted=None if args.functions=='all' else {int(line.split()[0],16) for line in Path(args.functions).read_text().splitlines() if line.strip()}
+                entries,extents=plan(fn_nodes,switches,wanted,imported.DIRECT_EXCLUDE)
+                imported.FN_ENTRIES=set(extents)
+                functions={e:emit_function(e,pcs,fn_nodes,entries,switches,lambda t:t in extents) for e,pcs in extents.items()}
+                print(f'Functions: {len(functions)} of {len(entries)} call targets, {sum(len(p) for p in extents.values())} instructions',flush=True)
         checkpoint('compiling',translation)
         dispatch=emit_blocks(nodes,args.steps,args.stop_at) if nodes is not None else emit_dispatch(pages,args.steps,args.stop_at,chain=args.chain)
         units=None
         if args.build=='cached':
-            units,dispatch=split_dispatch(pages,args.steps,args.stop_at,chain=args.chain)
+            units,dispatch=split_dispatch(pages,args.steps,args.stop_at,chain=args.chain,functions=functions)
         source = runtime_source+'\n'+dispatch+'\n'+setup+f'''reserve(STACK_BASE,STACK_SIZE,NULL);
 reserve({TLS_BASE}ull,{TLS_SIZE},NULL);
 Cpu *c=&state; c->sp=STACK_BASE+STACK_SIZE-16; c->tpidrro={TLS_BASE}ull;

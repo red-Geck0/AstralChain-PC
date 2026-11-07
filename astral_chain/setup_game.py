@@ -35,6 +35,7 @@ WORK = GAME/'work'
 BUILD = PROJECT/'build'
 USERDATA = PROJECT/'userdata'
 SETTINGS = USERDATA/'setup.json'
+FUNCTIONS = os.environ.get('AC_FUNCTIONS', '' if (USERDATA/'functions-off.txt').is_file() else 'all')  # (test build: switch_build.py)
 
 DOWNLOADS = {
     'zig': ('https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip',
@@ -320,6 +321,7 @@ def fingerprint():
             if path.is_file() and '__pycache__' not in path.parts and 'data' not in path.relative_to(root).parts[:1]:
                 digest.update(str(path.relative_to(PROJECT)).encode())
                 digest.update(path.read_bytes())
+    digest.update(FUNCTIONS.encode())  # (function-lifter experiment: --functions)
     return digest.hexdigest()
 
 
@@ -345,6 +347,8 @@ def build_game():
                '--follow', '0', '--entry', 'rtld:start', '--seed-all-text', '--build', 'cached',
                '--control', CONTROL, '--romfs', ROMFS_IMAGE, '--nvn-hle', '--nvn-backend', 'vulkan',
                '--optimize', '--lean', '--direct-calls', '--jumps']
+    if FUNCTIONS:  # (experiment: 'all' or a file of hot guest pages)
+        command += ['--functions', FUNCTIONS]
     for patch in PATCHES:
         command += ['--patch', patch]
     command.append('--build-only')
