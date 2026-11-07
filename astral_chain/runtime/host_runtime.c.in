@@ -551,9 +551,17 @@ void rt_svc(Cpu*c,uint32_t imm,uint64_t pc) {
   if(ns<=0) SwitchToThread();
   else {
    uint64_t until=rt_ticks()+(uint64_t)(((__uint128_t)(uint64_t)ns*19200000+999999999)/1000000000);
+   /* Short sleeps block on a high resolution timer: worker threads poll in sleep loops, and spinning here kept three
+    * cores busy all the time (on a handheld that power is taken from the threads doing the work). AC_SLEEP_SPIN=1: as before. */
+   static int spin=-1;
+   static __thread HANDLE timer;
+   if(spin<0) spin=GetEnvironmentVariableA("AC_SLEEP_SPIN",NULL,0)!=0;
+   if(!spin && !timer) timer=CreateWaitableTimerExW(NULL,NULL,0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,TIMER_ALL_ACCESS);
    for(uint64_t now=rt_ticks();now<until;now=rt_ticks()) {
-    uint64_t left_ms=(until-now)/19200;
-    if(left_ms>=2) Sleep((DWORD)(left_ms-1)); else SwitchToThread();
+    uint64_t left=until-now,left_ms=left/19200;
+    LARGE_INTEGER due;due.QuadPart=-(LONGLONG)(left*25/48);  /* (19.2 MHz ticks to 100 ns units) */
+    if(timer && SetWaitableTimer(timer,&due,0,NULL,NULL,FALSE)) WaitForSingleObject(timer,INFINITE);
+    else if(left_ms>=2) Sleep((DWORD)(left_ms-1)); else SwitchToThread();
    }
   }
   c->x[0]=0;return;
@@ -1501,7 +1509,9 @@ uint64_t rt_ticks(void) {
  LARGE_INTEGER counter;
  if(!frequency.QuadPart && (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0)) boundary("timer-frequency",&state,state.pc);
  if(!QueryPerformanceCounter(&counter) || counter.QuadPart<0) boundary("timer-counter",&state,state.pc);
- return (uint64_t)(((__uint128_t)(uint64_t)counter.QuadPart*19200000ull)/(uint64_t)frequency.QuadPart);
+ /* The same value as counter*19200000/frequency, without a slow 128-bit division (the game reads the clock very often) */
+ uint64_t c=(uint64_t)counter.QuadPart,f=(uint64_t)frequency.QuadPart;
+ return c/f*19200000ull+c%f*19200000ull/f;
 }
 static void reserve(uint64_t base,size_t size,const char *file) {
  void *p=VirtualAlloc((void*)(uintptr_t)base,size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
