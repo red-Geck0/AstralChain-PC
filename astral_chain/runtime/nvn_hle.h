@@ -610,10 +610,12 @@ static DWORD WINAPI prof_thread(LPVOID unused) {
   }
  }
 }
-/* AC_PROFILE_THREAD=N (parallel mode): sample guest thread N's host thread instead of thread 0's. */
+/* AC_PROFILE_THREAD=N (parallel mode): sample guest thread N's host thread instead of thread 0's.
+ * AC_PROFILE_THREAD=worker: the AC_ASYNC_SUBMIT worker (the Vulkan backend), as thread 99. */
 static void prof_attach(unsigned thread) {
  static int wanted=-2;
- if(wanted==-2) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PROFILE_THREAD",v,sizeof(v));wanted=n && n<sizeof(v) ? atoi(v) : 0;}
+ if(wanted==-2) {char v[16];DWORD n=GetEnvironmentVariableA("AC_PROFILE_THREAD",v,sizeof(v));
+  wanted=n && n<sizeof(v) ? (!strcmp(v,"worker") ? 99 : atoi(v)) : 0;}
  if((int)thread!=wanted || !GetEnvironmentVariableA("AC_PROFILE",NULL,0)) return;
  if(!DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&prof_target,THREAD_ALL_ACCESS,FALSE,0)) return;
  {ULONG_PTR low,high;GetCurrentThreadStackLimits(&low,&high);prof_stack_low=low;prof_stack_high=high;
@@ -630,6 +632,7 @@ static void prof_attach(unsigned thread) {
  printf("PROFILE sampling the host thread of guest thread %u\n",thread);
 }
 static void prof_start(void) {prof_attach(0);}
+void nvn_prof_attach_worker(void) {prof_attach(99);}  /* (las/nvn/objects.c aq_worker) */
 /* Park the calling guest thread until done(seq) (a GPU submission finished).
  * Returns 0 when no other guest context exists; the caller then blocks. */
 int nvn_park_gpu(uint64_t seq,int (*done)(uint64_t)) {

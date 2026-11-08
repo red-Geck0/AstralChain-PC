@@ -138,6 +138,8 @@ extern const char *rt_where(const char *);
 static const char *volatile aq_worker_where = "-";
 static void *aq_worker(void *arg) {
     (void)arg;
+    extern void nvn_prof_attach_worker(void);
+    nvn_prof_attach_worker();  // (AC_PROFILE_THREAD=worker)
     for (;;) {
         pthread_mutex_lock(&aq_lock);
         aq_worker_where = "idle";
