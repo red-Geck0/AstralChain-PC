@@ -27,6 +27,14 @@ volatile int ac_uncapped=-1;      /* AC_UNCAPPED=1: no 60 FPS pacing in gameplay
 volatile int ac_in_cutscene;      /* (svc #0xB1: the game reports its cutscene mode each frame) */
 volatile int ac_title_credit=-1;  /* "Port by Puddz" on the title screen (las/menu.cpp); AC_TITLE_CREDIT=0: off */
 volatile int ac_title_own_twin=-1;  /* AC_TITLE_OWN_TWIN=1: the title shows the player's twin (svc #0xB4) */
+volatile int ac_swap_ab=-1;      /* AC_SWAP_AB=1: the controllers' A and B swapped (hid_service.h, las/button_prompts.c) */
+
+/* Swap A and B: the bottom face button (Xbox A, PlayStation cross) is the Switch's A, which confirms and talks, and the
+ * right one its B. By default the buttons go by position, as on the Switch, where A is on the right. */
+int ac_swap_ab_on(void) {
+ if(ac_swap_ab<0) {char v[4];DWORD n=GetEnvironmentVariableA("AC_SWAP_AB",v,sizeof(v));ac_swap_ab=n==1 && v[0]=='1';}
+ return ac_swap_ab;
+}
 
 int ac_prompt_parse(const char *v) {
  if(!v || !*v || !strcmp(v,"auto")) return 0;
