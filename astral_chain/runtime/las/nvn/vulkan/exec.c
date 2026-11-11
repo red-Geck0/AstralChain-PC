@@ -14,6 +14,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "framegen.h"
 #include "../renderer.h"
 #include "../../settings.h"
 
@@ -503,7 +504,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
+        fg_queue_lock();  // (frame generation: its swapchain submits to this queue from its own threads)
         VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        fg_queue_unlock();
         if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
         VK_CHECK(sr);
         PROF_ADD(prof_submit);
@@ -1155,15 +1158,17 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 #define MV_OBJECT_VS 0x193cf583896ed056ull
 #define MV_OBJECT_FS 0x6185e39f4c367054ull
 #define MV_SLOT 3
+#define FG_COMPOSITE_FS 0x8ff00b5e37c9be02ull  // (frame generation) the final composite, before the HUD
 static bool mv_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("AC_MOTION_VECTORS"); on = e && e[0] == '1'; }
+    if (on < 0) { const char *e = getenv("AC_MOTION_VECTORS"); on = (e && e[0] == '1') || fg_wanted(); }
     return on;
 }
 static NvnTexture *mv_game_tex;  // the game's velocity texture (target 0 of the patched programs' passes)
 static int mv_draw_kind;         // the program of the draw starting a pass: 1 camera, 2 object, 0 other
 static bool mv_attached;         // the current pass has mv_image as target MV_SLOT
 static TexBackend mv_img;        // RG16F, the size of the game's velocity texture
+static NvnTexture *mv_depth_tex;  // the game's scene depth, as its object velocity pass uses it (frame generation)
 static VkImageView mv_view(uint32_t w, uint32_t h) {
     TexBackend *d = &mv_img;
     if (d->image && (d->width != w || d->height != h)) {
@@ -1243,6 +1248,7 @@ static void begin_pass(void) {
     mv_attached = false;
     if (mv_on() && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {  // (motion vectors: target MV_SLOT)
         if (mv_draw_kind) mv_game_tex = st.rt.color[0];
+        if (mv_draw_kind == 2 && st.rt.depth) mv_depth_tex = st.rt.depth;
         if (st.rt.color[0] == mv_game_tex && (st.rt.ncolor <= MV_SLOT || !st.rt.color[MV_SLOT]) && pass_samples == 1) {
             TexBackend *gb = st.rt.color[0]->backend;
             VkImageView v = mv_view(gb->width, gb->height);
@@ -1503,7 +1509,8 @@ typedef struct {
     bool warmed, drawn;  // (program warm-up: created ahead of its first draw / drawn since)
     uint64_t ident;      // its code hashes and keys as created, the same in every session (pipeline warm-up records)
     VkPipeline vs_lib, fs_lib;  // its shader libraries (shader libraries below), or NULL
-    uint8_t mv_kind;    // (AC_MOTION_VECTORS) 1: the game's camera velocity program, 2: its object velocity program
+    uint8_t mv_kind;    // (AC_MOTION_VECTORS) 1: the game's camera velocity program, 2: its object velocity program,
+                        // 3: its final composite (frame generation: the image before the HUD)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -1802,7 +1809,7 @@ static void translate_program(void *arg) {
         atomic_store(&p->state, 2);
         return;
     }
-    if (p->mv_kind) mv_patch_glsl(p);
+    if (p->mv_kind == 1 || p->mv_kind == 2) mv_patch_glsl(p);
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
@@ -1863,7 +1870,8 @@ static Prog *get_program_ex(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bo
     p->fkey = *fkey;
     uint64_t sh[2] = {stage_hash(np, 0), stage_hash(np, 1)};
     p->ident = hmix(hmix(hmix(0xcbf29ce484222325ull, sh, sizeof sh), vkey, sizeof *vkey), fkey, sizeof *fkey);
-    if (mv_on()) p->mv_kind = sh[1] == MV_CAMERA_FS ? 1 : sh[0] == MV_OBJECT_VS && sh[1] == MV_OBJECT_FS ? 2 : 0;
+    if (mv_on()) p->mv_kind = sh[1] == MV_CAMERA_FS ? 1 : sh[0] == MV_OBJECT_VS && sh[1] == MV_OBJECT_FS ? 2
+                             : sh[1] == FG_COMPOSITE_FS ? 3 : 0;
     pipe_warm_add(p);
     p->warmed = !from_draw;
     if (from_draw) warm_record(np, vkey, fkey);
@@ -4244,9 +4252,16 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 }
 
 static void draw_(CmdRec *r, bool indexed);
+static Prog *g_drawn;  // the program of the draw just recorded (draw_), or NULL
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
+    g_drawn = NULL;
     draw_(r, indexed);
+    if (g_drawn && g_drawn->mv_kind == 3 && fg_active() && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && mv_depth_tex &&
+        mv_depth_tex->backend) {  // (frame generation) the image before the HUD, with this frame's vectors and depth
+        vk_end_pass();
+        fg_capture(vk_cmd(), st.rt.color[0], st.rt.color[0]->backend, &mv_img, mv_depth_tex->backend);
+    }
     PROF_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
@@ -4373,7 +4388,12 @@ static void draw_(CmdRec *r, bool indexed) {
         if (per_draw < 0) per_draw = getenv("LARECOMP_GPUPROF_DRAWS") != NULL;
         if (g_gpuprof_frame && per_draw && in_pass) vk_end_pass();
     }
-    mv_draw_kind = pr->mv_kind;  // (motion vectors: a pass begun by a velocity program learns the game's velocity texture)
+    mv_draw_kind = pr->mv_kind == 1 || pr->mv_kind == 2 ? pr->mv_kind : 0;  // (a pass begun by a velocity program
+                                                                           //  learns the game's velocity texture)
+    if (pr->mv_kind == 1 && st.ubuf[1][13].addr && st.ubuf[1][13].size >= 16) {  // (frame generation: the camera)
+        const float *u = (const float *)(uintptr_t)st.ubuf[1][13].addr;  // near, far, tan(fov x / 2), tan(fov y / 2)
+        fg_note_camera(u[0], u[1], u[3]);
+    }
     begin_pass();
     mv_draw_kind = 0;
     VkCommandBuffer cb = vk_cmd();
@@ -4427,7 +4447,7 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(k.blend[i], st.blend[i], 8);
         }
     }
-    if (mv_attached && pr->mv_kind && k.ncolor > MV_SLOT) k.write_mask[MV_SLOT] = 0x3;  // (motion vectors: R, G)
+    if (mv_attached && (pr->mv_kind == 1 || pr->mv_kind == 2) && k.ncolor > MV_SLOT) k.write_mask[MV_SLOT] = 0x3;  // (R, G)
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
@@ -4788,6 +4808,7 @@ static void draw_(CmdRec *r, bool indexed) {
         else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
     oq_draw(cb, true);
+    g_drawn = pr;
     stat_draws++; vk_draws_total++;
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {
@@ -5301,6 +5322,36 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         piw = b->width; pih = b->height; pow_ = ow; poh = oh; psm = smaa; pfs = fsr;
     }
     return v;
+}
+
+// (frame generation, framegen.c) The present shader drawing b into (vx, vy, vw, vh) of target (window-sized, the
+// window's format), cleared to black, without post-processing: the image before the HUD, placed as the game image is.
+void vk_present_draw_raw(VkCommandBuffer cb, TexBackend *b, VkImageView target, VkExtent2D ext, float vx, float vy, float vw,
+                         float vh, const float pv[8]) {
+    if (!b || !b->image) return;
+    vk_full_barrier(cb);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target,
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color.float32 = {0, 0, 0, 1}};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, ext}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    VkDescriptorSet ds = vk_alloc_set(present_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), raw_view(b), VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline(g_vk.sc_format));
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
+    VkViewport vp = {vx, vy, vw, vh, 0, 1};
+    VkRect2D sc = {{0, 0}, ext};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    vk_full_barrier(cb);
+    ss_forget();
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).

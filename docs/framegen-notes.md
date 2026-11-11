@@ -103,9 +103,68 @@ generation must pair them the same way, with the motion vectors and depth of the
 Cost: none measurable. In the `eksplorasi` scene, alternating runs gave 63.8 and 66.0 fps with the vectors on, and 63.3
 and 64.2 fps with them off.
 
+## Implemented: frame generation (AC_FRAMEGEN=1)
+
+The code is in `las/nvn/vulkan/framegen.c`, with hooks in `device.c` and `exec.c`. It uses AMD FSR 3.1 frame
+generation through the AMD FSR SDK 2.4.0 frame generation swapchain for Vulkan. It is off by default. When it is on, it
+also turns the motion vectors on.
+
+**The SDK.** It is loaded at run time from `tools/fidelityfx`, which is not in git: `amd_fidelityfx_loader_vk.dll` and
+`amd_fidelityfx_framegeneration_vk.dll`, signed by AMD, from the SDK repository at tag v2.4.0,
+`Kits/FidelityFX/signedbin`. The API headers are in `third_party/FidelityFX`. On the Arc B390 the providers are frame
+generation 3.1.6 and, for the swapchain, the newest one. AMD FSR Frame Generation 4 is not offered there.
+
+**Queues.** The device gets extra queues: async compute 1.0, present 1.1 and image acquire 1.2, all in the compute
+family, which can present. Present from the transfer family gave the same driver fault, which was really the
+swapchain-image bug described below. `AC_FG_PRESENT=transfer` uses the transfer family. The swapchain submits to the
+game queue from its own threads, so every submission to `g_vk.queue` takes `fg_queue_lock`.
+
+**Swapchain.** The SDK's swapchain replaces Vulkan's. The port acquires, presents and gets its images through the
+SDK's replacement functions. Two pitfalls were found on the B390:
+- `vkGetSwapchainImagesKHR`'s replacement must be called twice, first for the count. Called once with a capacity of
+  8, it reported 8 but did not fill them, and creating views of the unfilled ones faulted in igvk64.dll at null +
+  0xc0.
+- The SDK asked for descriptor pools of 4 and then 8 million descriptors of each type. The second failed with
+  `VK_ERROR_OUT_OF_HOST_MEMORY`, so the frame generation context was never created; the SDK only reported error 3.
+  `fg_device_proc`, which is the `vkGetDeviceProcAddr` the SDK is given, caps pools at 262144 of each type. It also
+  maps the KHR aliases the SDK asks for to the core functions.
+
+**Pacing.** Hybrid spin and fence waits are used instead of the SDK's default busy spinning. `AC_FG_SPIN=1` restores
+the default.
+
+**Per frame inputs.**
+- *Capture.* After the game's final composite draw (fs `8ff00b5e37c9be02`, just before the HUD in the same pass), the
+  pass is ended and `fg_capture` copies three images into a slot keyed by that target texture: the target itself (the
+  image before the HUD), `mv_img`, and the scene depth (D24S8, the object velocity pass's depth).
+- *Camera.* Near, far and tan(fovY/2) are read from the camera velocity draw's cb13: 0.1, 9999.9 and 0.4877, which is
+  52.5 degrees.
+- *At present.* `fg_present_record` takes the slot of the presented texture. It draws the copy into a window-sized
+  image with the present shader (the image before the HUD, letterboxed like the backbuffer), configures generation
+  with that image and the letterbox rectangle as the generation rect, and dispatches the prepare step with depth and
+  vectors. The motion vector scale is `(-w/2, +h/2)`: the SDK wants pixels from the current position to the previous
+  one.
+- *When it is off.* Frames whose texture has no new capture have generation off: menus, loading, the title screen.
+
+**Debugging.** `AC_FG_DEBUG=1` draws the SDK's tear, reset and pacing lines; `AC_FG_DEBUG=2` shows its debug view.
+`AC_FG_DEPTH_INVERTED=1` sets the inverted depth flag; whether the game's depth is inverted is not known yet.
+`AC_FG_ASYNC=1` runs generation on the async compute queue.
+
+### Results (2026-11-11, recorded scenes)
+
+| `eksplorasi` scene | Game fps | Frames shown |
+|---|---|---|
+| Frame generation off | 61.9 | 61.9 |
+| On (hybrid spin) | 51.8 | about 104 (presents are 2 per game frame) |
+| On, async compute | 45.3 | about 91 |
+
+- **`cutscene` scene.** Stable through the menus, the explosive cutscene (57 game fps, capped at 60) and gameplay.
+- **Screen captures.** Taken with CopyFromScreen during camera turns: the HUD stays sharp, and there are no visible
+  artifacts around the player.
+
 Open points:
-- the value of K;
-- whether other velocity shaders exist (cutscenes, other areas);
+- the depth direction (inverted or not);
 - disocclusion and particles: transparent effects have no motion vectors;
-- the effort of integrating FSR 3's Vulkan frame interpolation into the port's present path. It needs the image before
-  the HUD, `mv_img` (negated and in FSR's units) and depth, from the same frame.
+- the base frame rate cost, which is about 16% (GPU and the swapchain's threads on a shared power budget);
+- frame generation follows the F1 menu as UI through the image before the HUD, which has not been checked in play;
+- the swapchain being made again (window resizing) has not been tested;
+- the value of K, and whether other velocity shaders exist in other areas.

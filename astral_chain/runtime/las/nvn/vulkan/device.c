@@ -15,6 +15,7 @@
 
 #include "../../settings.h"
 #include "vk.h"
+#include "framegen.h"
 #include "../renderer.h"
 
 VkG g_vk;
@@ -182,8 +183,11 @@ static void create_device(void) {
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceRobustness2FeaturesEXT r2have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-    VkPhysicalDeviceVulkan13Features f13have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    VkPhysicalDeviceVulkan12Features f12have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                 .pNext = robust2 ? &r2have : NULL};
+    VkPhysicalDeviceVulkan11Features f11have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12have};
+    VkPhysicalDeviceVulkan13Features f13have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                                .pNext = &f11have};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13have};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     if (gpl) {
@@ -230,6 +234,15 @@ static void create_device(void) {
                                                               .graphicsPipelineLibrary = VK_TRUE, .pNext = f.pNext};
     if (gpl) f.pNext = &gplf;
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
+    if (fg_wanted()) {  // (frame generation: what the AMD FSR SDK's shaders use where the GPU has it)
+        f13.subgroupSizeControl = f13have.subgroupSizeControl;
+        f13.computeFullSubgroups = f13have.computeFullSubgroups;
+        f12.shaderFloat16 = f12have.shaderFloat16;
+        f12.shaderSubgroupExtendedTypes = f12have.shaderSubgroupExtendedTypes;
+        f11.uniformAndStorageBuffer16BitAccess = f11have.uniformAndStorageBuffer16BitAccess;
+        b->shaderInt16 = h->shaderInt16;
+        b->shaderStorageImageReadWithoutFormat = h->shaderStorageImageReadWithoutFormat;
+    }
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
     b->fillModeNonSolid = h->fillModeNonSolid;
@@ -254,10 +267,13 @@ static void create_device(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    VkDeviceQueueCreateInfo qis[5] = {qi};  // (frame generation: its swapchain's queues)
+    uint32_t nqi = 1 + fg_device_queues(qis + 1, 4);
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = nqi,
+                             .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    fg_device_created();
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
@@ -379,13 +395,16 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
+    // (AC_FRAMEGEN) the AMD FSR SDK's frame generation swapchain, made again in place when the window changes
+    bool fg = fg_create_swapchain(&ci, &g_vk.swapchain);
+    if (!fg) VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (old && !fg) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
-    vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    if (fg) fg_get_images(&g_vk.sc_count, g_vk.sc_images);
+    else vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
@@ -395,6 +414,7 @@ static void create_swapchain(void) {
 }
 
 static void recreate_swapchain(void) {
+    fg_wait_presents();
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
 }
@@ -427,6 +447,8 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
 
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
+// (frame generation) the game texture being presented and where it is drawn (backend_present), for vk_frame_end
+static struct { const void *tex; TexBackend *b; float rect[4], pv[8]; } fg_cur;
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
@@ -443,10 +465,12 @@ bool vk_frame_begin(const float clear[4]) {
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = fg_active() ? fg_acquire(acquire_sem[slot], &cur_frame.image)
+               : vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
-        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        r = fg_active() ? fg_acquire(acquire_sem[slot], &cur_frame.image)
+          : vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
@@ -508,6 +532,9 @@ void vk_frame_end(const char *shot_path) {
     vkCmdEndRendering(cb);
     VkSpan shot = {0};
     if (shot_path) save_window_image(cb, &shot);
+    if (fg_active()) fg_present_record(cb, fg_cur.tex, fg_cur.b, fg_cur.rect[0], fg_cur.rect[1], fg_cur.rect[2], fg_cur.rect[3], fg_cur.pv);
+    fg_cur.tex = NULL;
+    fg_cur.b = NULL;
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     uint32_t img = cur_frame.image;
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
@@ -515,7 +542,7 @@ void vk_frame_end(const char *shot_path) {
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
-    VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult r = fg_active() ? fg_present(&pi) : vkQueuePresentKHR(g_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
@@ -665,6 +692,10 @@ void backend_present(NvnTexture *t) {
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, uv[0], uv[1], uv[2], uv[3]};
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        fg_cur.tex = t;
+        fg_cur.b = b;
+        fg_cur.rect[0] = (float)vx; fg_cur.rect[1] = (float)vy; fg_cur.rect[2] = (float)vw; fg_cur.rect[3] = (float)vh;
+        memcpy(fg_cur.pv, pv, sizeof fg_cur.pv);
         // Astral Chain: the in-game settings menu over the picture (menu.cpp; nothing while it is closed).
         // (test) AC_MENU_AT=<frame>: open it at that frame.
         static long menu_at = -1;
