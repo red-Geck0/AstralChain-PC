@@ -60,6 +60,52 @@ FSR 3 frame interpolation needs exact screen-space motion vectors, depth, and th
   - The camera pass can drop the `saturate(depth/100)^2 * K` factor in the copy.
   - The object pass can drop the bias, the `x10` and the clamp in the copy.
 
-Open points: the value of K; whether other velocity shaders exist (cutscenes, other areas); where the game samples the
-buffer (motion blur pass); and the effort of integrating FSR 3's Vulkan frame interpolation into the port's present
-path.
+## Implemented: exact motion vectors (AC_MOTION_VECTORS=1)
+
+`las/nvn/vulkan/exec.c`, section "motion vectors". It is off by default, so normal play is unchanged.
+
+- **Patched programs.** When it is on, the two velocity programs are recognised by stage hash: camera fs
+  `331abe0da603979f`; object vs `193cf583896ed056` with fs `6185e39f4c367054`. Their translated GLSL is patched before
+  it is compiled (`mv_patch_glsl`):
+  - The camera fs writes `vec4(r2, r1, 0, 1)`, which is now minus previous, to `layout(location = 3)`. It is taken
+    before the game's depth falloff and strength.
+  - The object vs passes its `ndc_now - ndc_prev` in a new varying, taken before the bias, the x10 and the clamp. The
+    object fs writes that varying to location 3.
+  - The patch matches lines of the translation. If a line is not found, the program is left unpatched, and the log says
+    `[mv] ... NOT patched`.
+- **Colour target 3.** This slot is unused in both passes. Here it is `mv_img`, a port-owned RG16F image the size of
+  the game's velocity texture.
+  - The image is attached in `begin_pass` whenever the game's velocity texture is target 0. That texture is learned
+    from the pass a velocity program begins.
+  - Only the patched programs get a write mask on it: R and G. Other draws in those passes leave it alone.
+  - The game's RGBA8 buffer, and so its motion blur, is unchanged.
+- **Units.** `mv_img` holds `ndc_now - ndc_prev`, with NDC y pointing up. In pixels of the image this is
+  `dx_px = mv.x * w/2`, and `dy_px = -mv.y * h/2` in image coordinates, where y points down. The previous position of a
+  pixel is `p - (dx_px, dy_px)`.
+- **Test dump.** `AC_MV_DUMP=<frame>,...` writes `frames/mv_<frame>.png` and `frames/mv_<frame>.bin` (u32 w, h, then
+  f32 dx, dy pixels per pixel), and puts statistics in the log.
+
+### Verification (2026-11-11, `eksplorasi` scene)
+
+The test warps frame N-1 by the motion vectors and compares the result with frame N, using the mean absolute luma error
+over the middle 3/4 of the screen. A correct vector field should bring the error well below the unwarped error.
+
+| MV of present | Frames | No warp | Warped (scale 1, y flipped) |
+|---|---|---|---|
+| 4140 (camera turning) | 4140 -> 4141 | 13.4 | **4.8** |
+| 4141 (camera turning) | 4141 -> 4142 | 22.0 | **9.2** |
+| 5000 (walking) | 5000 -> 5001 | 11.3 | **5.2** |
+
+Other scales (0.5, 1.5, 2) and an unflipped y are all worse. The motion vectors read back at the present of frame N
+belong to the frame shown at N+1: the game has already sent the next frame's rendering when it presents. Frame
+generation must pair them the same way, with the motion vectors and depth of the frame being shown.
+
+Cost: none measurable. In the `eksplorasi` scene, alternating runs gave 63.8 and 66.0 fps with the vectors on, and 63.3
+and 64.2 fps with them off.
+
+Open points:
+- the value of K;
+- whether other velocity shaders exist (cutscenes, other areas);
+- disocclusion and particles: transparent effects have no motion vectors;
+- the effort of integrating FSR 3's Vulkan frame interpolation into the port's present path. It needs the image before
+  the HUD, `mv_img` (negated and in FSR's units) and depth, from the same frame.

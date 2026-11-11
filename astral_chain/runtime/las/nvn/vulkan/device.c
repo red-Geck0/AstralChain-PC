@@ -635,6 +635,10 @@ void backend_present(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+    {   // (test) AC_MV_DUMP: the motion vector image of this frame (exec.c, AC_MOTION_VECTORS)
+        extern void vk_mv_frame(uint64_t frame);
+        vk_mv_frame(total_frames);
+    }
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     bool have = vk_frame_begin(black);

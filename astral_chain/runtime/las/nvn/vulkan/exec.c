@@ -1144,6 +1144,54 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+// ================================================================== motion vectors (Astral Chain, frame generation)
+// AC_MOTION_VECTORS=1: exact screen-space motion for every pixel, in a port-owned RG16F image (mv_image), for frame
+// generation. The game renders a velocity buffer for its motion blur (RGBA8, docs/framegen-notes.md): a fullscreen
+// camera pass from depth, then moving meshes over it. Its values are weakened near the camera, scaled, clipped at
+// about 48 px and 8 bit. Those two programs are patched (mv_patch_glsl) to also write the plain
+// ndc_now - ndc_prev, unweakened and unclipped, to colour target 3, which is unused in both passes and is mv_image
+// while the game's velocity texture is target 0. The game's own buffer is unchanged.
+#define MV_CAMERA_FS 0x331abe0da603979full  // (stage hashes, as in the [draw] log)
+#define MV_OBJECT_VS 0x193cf583896ed056ull
+#define MV_OBJECT_FS 0x6185e39f4c367054ull
+#define MV_SLOT 3
+static bool mv_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("AC_MOTION_VECTORS"); on = e && e[0] == '1'; }
+    return on;
+}
+static NvnTexture *mv_game_tex;  // the game's velocity texture (target 0 of the patched programs' passes)
+static int mv_draw_kind;         // the program of the draw starting a pass: 1 camera, 2 object, 0 other
+static bool mv_attached;         // the current pass has mv_image as target MV_SLOT
+static TexBackend mv_img;        // RG16F, the size of the game's velocity texture
+static VkImageView mv_view(uint32_t w, uint32_t h) {
+    TexBackend *d = &mv_img;
+    if (d->image && (d->width != w || d->height != h)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+        d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R16G16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL) != VK_SUCCESS) {
+            d->image = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
+        }
+        d->format = VK_FORMAT_R16G16_SFLOAT; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(vk_cmd(), d->image, d->aspect);
+        LOG("[mv] motion vector image %ux%u\n", w, h);
+    }
+    static const VkComponentMapping id = {0};
+    return vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
@@ -1191,6 +1239,28 @@ static void begin_pass(void) {
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;
         pass_samples = b->samples;
+    }
+    mv_attached = false;
+    if (mv_on() && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {  // (motion vectors: target MV_SLOT)
+        if (mv_draw_kind) mv_game_tex = st.rt.color[0];
+        if (st.rt.color[0] == mv_game_tex && (st.rt.ncolor <= MV_SLOT || !st.rt.color[MV_SLOT]) && pass_samples == 1) {
+            TexBackend *gb = st.rt.color[0]->backend;
+            VkImageView v = mv_view(gb->width, gb->height);
+            if (v) {
+                for (uint32_t i = pass_ncolor; i < MV_SLOT; i++) {
+                    ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                    pass_color[i] = VK_FORMAT_UNDEFINED;
+                }
+                ca[MV_SLOT] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
+                                                          .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                                          .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+                pass_color[MV_SLOT] = VK_FORMAT_R16G16_SFLOAT;
+                if (pass_ncolor <= MV_SLOT) pass_ncolor = MV_SLOT + 1;
+                if (gb->width < minw) minw = gb->width;
+                if (gb->height < minh) minh = gb->height;
+                mv_attached = true;
+            }
+        }
     }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
@@ -1433,6 +1503,7 @@ typedef struct {
     bool warmed, drawn;  // (program warm-up: created ahead of its first draw / drawn since)
     uint64_t ident;      // its code hashes and keys as created, the same in every session (pipeline warm-up records)
     VkPipeline vs_lib, fs_lib;  // its shader libraries (shader libraries below), or NULL
+    uint8_t mv_kind;    // (AC_MOTION_VECTORS) 1: the game's camera velocity program, 2: its object velocity program
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -1638,6 +1709,68 @@ static void compile_program(void *arg) {
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
+// (AC_MOTION_VECTORS) The velocity programs' translated GLSL, patched to also write ndc_now - ndc_prev to colour
+// target MV_SLOT. The anchors are lines of the translation of these two programs (the game's motion blur code):
+//   camera fs: r2 = r2 - r3; r1 = r1 - r4 (now - previous, NDC), before saturate(depth / 100)^2 * strength;
+//   object vs: r0 / r2 = now - previous (NDC), before the - 0.001 bias, the x 10 and the clamp.
+// The object vs hands its value to the fs in a new varying after its last output. Any anchor missing: unpatched.
+static char *mv_insert(char *src, size_t at, const char *text) {
+    size_t n = strlen(src), k = strlen(text);
+    char *out = malloc(n + k + 1);
+    if (!out) return src;
+    memcpy(out, src, at);
+    memcpy(out + at, text, k);
+    memcpy(out + at + k, src + at, n - at + 1);
+    free(src);
+    return out;
+}
+static long mv_line_start(const char *src, const char *anchor) {  // start of the line containing anchor, or -1
+    const char *a = strstr(src, anchor);
+    if (!a || strstr(a + 1, anchor)) return -1;  // (missing or not unique)
+    while (a > src && a[-1] != '\n') a--;
+    return a - src;
+}
+static bool mv_patch_main(char **src, const char *decl, const char *init) {
+    char *m = strstr(*src, "\nvoid main() {\n");
+    if (!m) return false;
+    size_t at = (size_t)(m - *src) + 1;
+    *src = mv_insert(*src, at + strlen("void main() {\n"), init);
+    *src = mv_insert(*src, at, decl);
+    return true;
+}
+static void mv_patch_glsl(Prog *p) {
+    bool ok = false;
+    const char *main_line = "\nvoid main() {\n";
+    if (!strstr(p->vi->msl, main_line) || !strstr(p->fi->msl, main_line)) {
+    } else if (p->mv_kind == 1) {
+        const char *anchor = "r1 = as_u((as_f(r1) + (-as_f(r4))));\n";
+        long at = mv_line_start(p->fi->msl, anchor);
+        if (at >= 0 && strstr(p->fi->msl, "r2 = as_u((as_f(r2) + (-as_f(r3))));")) {
+            at += (long)(strstr(p->fi->msl + at, anchor) - (p->fi->msl + at) + strlen(anchor));
+            p->fi->msl = mv_insert(p->fi->msl, (size_t)at, "    ac_mv = vec4(as_f(r2), as_f(r1), 0.0f, 1.0f);\n");
+            ok = mv_patch_main(&p->fi->msl, "layout(location = 3) out vec4 ac_mv;\n", "  ac_mv = vec4(0.0f);\n");
+        }
+    } else if (p->mv_kind == 2) {
+        int loc = -1;
+        for (const char *s = p->vi->msl; (s = strstr(s, "layout(location = ")) != NULL; s++) {
+            int n = 0;
+            char dir[4] = {0};
+            if (sscanf(s, "layout(location = %d) %3s", &n, dir) == 2 && !strcmp(dir, "out") && n > loc) loc = n;
+        }
+        long at = mv_line_start(p->vi->msl, "r0 = as_u((as_f(r0) + as_f(0xba83126fu)));");
+        if (loc >= 0 && loc < 30 && at >= 0) {
+            char decl[160];
+            p->vi->msl = mv_insert(p->vi->msl, (size_t)at, "    ac_mv_v = vec2(as_f(r0), as_f(r2));\n");
+            snprintf(decl, sizeof decl, "layout(location = %d) out vec2 ac_mv_v;\n", loc + 1);
+            ok = mv_patch_main(&p->vi->msl, decl, "  ac_mv_v = vec2(0.0f);\n");
+            snprintf(decl, sizeof decl, "layout(location = %d) in vec2 ac_mv_v;\nlayout(location = 3) out vec4 ac_mv;\n", loc + 1);
+            ok = ok && mv_patch_main(&p->fi->msl, decl, "  ac_mv = vec4(ac_mv_v, 0.0f, 1.0f);\n");
+        }
+    }
+    LOG("[mv] %s velocity program %s\n", p->mv_kind == 1 ? "camera" : "object", ok ? "patched" : "NOT patched (anchor not found)");
+    if (!ok) p->mv_kind = 0;
+}
+
 static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
@@ -1669,6 +1802,7 @@ static void translate_program(void *arg) {
         atomic_store(&p->state, 2);
         return;
     }
+    if (p->mv_kind) mv_patch_glsl(p);
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
@@ -1729,6 +1863,7 @@ static Prog *get_program_ex(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bo
     p->fkey = *fkey;
     uint64_t sh[2] = {stage_hash(np, 0), stage_hash(np, 1)};
     p->ident = hmix(hmix(hmix(0xcbf29ce484222325ull, sh, sizeof sh), vkey, sizeof *vkey), fkey, sizeof *fkey);
+    if (mv_on()) p->mv_kind = sh[1] == MV_CAMERA_FS ? 1 : sh[0] == MV_OBJECT_VS && sh[1] == MV_OBJECT_FS ? 2 : 0;
     pipe_warm_add(p);
     p->warmed = !from_draw;
     if (from_draw) warm_record(np, vkey, fkey);
@@ -4238,7 +4373,9 @@ static void draw_(CmdRec *r, bool indexed) {
         if (per_draw < 0) per_draw = getenv("LARECOMP_GPUPROF_DRAWS") != NULL;
         if (g_gpuprof_frame && per_draw && in_pass) vk_end_pass();
     }
+    mv_draw_kind = pr->mv_kind;  // (motion vectors: a pass begun by a velocity program learns the game's velocity texture)
     begin_pass();
+    mv_draw_kind = 0;
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -4290,6 +4427,7 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(k.blend[i], st.blend[i], 8);
         }
     }
+    if (mv_attached && pr->mv_kind && k.ncolor > MV_SLOT) k.write_mask[MV_SLOT] = 0x3;  // (motion vectors: R, G)
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
@@ -4305,7 +4443,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
         pipe_tab_used++;
-        pipe_record(pr, &k);
+        if (!mv_attached) pipe_record(pr, &k);  // (motion vector passes are not recorded: a target set of the port's)
         // the draw needs it now: linked from shader libraries, or built here rather than queued for a worker and
         // waited for (see wait_built)
         if (gpl_link(pp)) {}
@@ -5183,6 +5321,91 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkCmdDraw(cb, 3, 1, 0, 0);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
+}
+
+// (test) AC_MV_DUMP=<frame>[,<frame>...] with AC_MOTION_VECTORS=1: at those frames' present, the motion vector image
+// as frames/mv_<frame>.png (R = 128 + 4 * dx, G = 128 + 4 * dy, in pixels of the image: 32 px to the edge) and its
+// statistics in the log.
+static float mv_half(uint16_t h) {
+    uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu, u;
+    if (!e) { float d = (float)m * 5.9604644775390625e-8f; return s ? -d : d; }
+    u = e == 31 ? s | 0x7F800000u | (m << 13) : s | ((e + 112u) << 23) | (m << 13);
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+void vk_mv_frame(uint64_t frame) {
+    static const char *list;
+    static int init;
+    if (!init) { init = 1; list = mv_on() ? getenv("AC_MV_DUMP") : NULL; }
+    if (!list || !mv_img.image) return;
+    bool want = false;
+    for (const char *p = list; *p;) {
+        if (strtoull(p, (char **)&p, 10) == frame) want = true;
+        if (*p != ',') break;
+        p++;
+    }
+    if (!want) return;
+    uint32_t w = mv_img.width, h = mv_img.height;
+    vk_end_pass();
+    VkBuffer buf;
+    VmaAllocation mem;
+    VmaAllocationInfo info;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (uint64_t)w * h * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo bai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(g_vk.vma, &bi, &bai, &buf, &mem, &info) != VK_SUCCESS) return;
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, mv_img.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+    renderer_flush();
+    vmaInvalidateAllocation(g_vk.vma, mem, 0, VK_WHOLE_SIZE);
+    const uint16_t *px = info.pMappedData;
+    uint8_t *rgba = malloc((size_t)w * h * 4);
+    double sum = 0, maxv = 0;
+    uint64_t moving = 0, bad = 0;
+    float minx = 0, maxx = 0, miny = 0, maxy = 0;
+    for (uint64_t i = 0; rgba && i < (uint64_t)w * h; i++) {
+        float dx = mv_half(px[i * 2]) * (float)w * 0.5f, dy = mv_half(px[i * 2 + 1]) * (float)h * 0.5f;
+        if (!isfinite(dx) || !isfinite(dy)) { bad++; dx = dy = 0; }
+        double len = sqrt((double)dx * dx + (double)dy * dy);
+        sum += len;
+        if (len > maxv) maxv = len;
+        if (len > 0.25) moving++;
+        if (dx < minx) minx = dx;
+        if (dx > maxx) maxx = dx;
+        if (dy < miny) miny = dy;
+        if (dy > maxy) maxy = dy;
+        float r = 128 + dx * 4, g = 128 + dy * 4;
+        rgba[i * 4 + 0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+        rgba[i * 4 + 1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+        rgba[i * 4 + 2] = 0;
+        rgba[i * 4 + 3] = 255;
+    }
+    if (rgba) {
+        char path[64];
+        mkdir("frames", 0755);
+        snprintf(path, sizeof path, "frames/mv_%05llu.png", (unsigned long long)frame);
+        vk_save_png(path, rgba, w, h);
+        snprintf(path, sizeof path, "frames/mv_%05llu.bin", (unsigned long long)frame);  // (u32 w, h, then dx, dy
+        FILE *f = fopen(path, "wb");                                                      //  per pixel: f32, pixels)
+        if (f) {
+            fwrite(&w, 4, 1, f);
+            fwrite(&h, 4, 1, f);
+            for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+                float d[2] = {mv_half(px[i * 2]) * (float)w * 0.5f, mv_half(px[i * 2 + 1]) * (float)h * 0.5f};
+                fwrite(d, 4, 2, f);
+            }
+            fclose(f);
+        }
+        snprintf(path, sizeof path, "frames/mv_%05llu.png", (unsigned long long)frame);
+        LOG("[mv] frame %llu %ux%u: mean %.2f px, max %.1f px, moving (> 0.25 px) %.1f%%, dx %.1f..%.1f, dy %.1f..%.1f, "
+            "not finite %llu -> %s\n", (unsigned long long)frame, w, h, sum / ((double)w * h), maxv,
+            100.0 * (double)moving / ((double)w * h), minx, maxx, miny, maxy, (unsigned long long)bad, path);
+        free(rgba);
+    }
+    vmaDestroyBuffer(g_vk.vma, buf, mem);
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
